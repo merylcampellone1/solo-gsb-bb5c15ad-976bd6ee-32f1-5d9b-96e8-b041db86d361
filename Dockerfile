@@ -22,4 +22,5 @@ EXPOSE 8000
 
 # 单 worker：状态保存在本地 JSON 文件，多 worker 亦安全（原子替换），
 # 这里保持单进程即可满足窑车现场单机使用。
-CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT} --workers 1 --timeout 30 'app.server:app'"]
+# 启动时先完成初始化（缺失的 data/state.json 由示例数据生成），再启动 Web 服务。
+CMD ["sh", "-c", "python -c 'from app.server import ensure_initialized; ensure_initialized(); print(\"init ok\")' && exec gunicorn --bind 0.0.0.0:${PORT} --workers 1 --timeout 30 'app.server:app'"]

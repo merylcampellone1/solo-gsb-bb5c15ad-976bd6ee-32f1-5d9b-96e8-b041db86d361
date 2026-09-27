@@ -1451,6 +1451,23 @@ def _signed_distance_to_polygon(
     return best if inside else -best
 
 
+def _parse_accel_g(ax: Any, ay: Any) -> Tuple[float, float]:
+    """把水平加速度输入解析为有限 float（单位 g）；非法值抛 ValueError。"""
+    try:
+        axv = float(ax)
+    except (TypeError, ValueError):
+        raise ValueError("水平加速度 x 分量必须是数值（单位 g）")
+    try:
+        ayv = float(ay)
+    except (TypeError, ValueError):
+        raise ValueError("水平加速度 y 分量必须是数值（单位 g）")
+    if not math.isfinite(axv):
+        raise ValueError("水平加速度 x 分量必须是有限数值（单位 g）")
+    if not math.isfinite(ayv):
+        raise ValueError("水平加速度 y 分量必须是有限数值（单位 g）")
+    return axv, ayv
+
+
 def overturn_check(
     raw_state: Optional[Dict[str, Any]], ax: Any, ay: Any
 ) -> Dict[str, Any]:
@@ -1470,18 +1487,7 @@ def overturn_check(
     evaluable=False 时 reason 说明无法评估的原因（无层 / 有层无有效承托 /
     落点不足以形成非零面积凸包 / 整架重量为 0）。
     """
-    try:
-        axv = float(ax)
-    except (TypeError, ValueError):
-        raise ValueError("水平加速度 x 分量必须是数值（单位 g）")
-    try:
-        ayv = float(ay)
-    except (TypeError, ValueError):
-        raise ValueError("水平加速度 y 分量必须是数值（单位 g）")
-    if not math.isfinite(axv):
-        raise ValueError("水平加速度 x 分量必须是有限数值（单位 g）")
-    if not math.isfinite(ayv):
-        raise ValueError("水平加速度 y 分量必须是有限数值（单位 g）")
+    axv, ayv = _parse_accel_g(ax, ay)
 
     norm = normalize(raw_state)
     layers = norm["layers"]
@@ -1617,4 +1623,310 @@ def overturn_check(
         "verdict": verdict,
         "unsupportedLayers": [],
         "layers": layer_rows,
+    }
+
+
+# --------------------------------------------------------------------------
+# 逐层装货顺序规划（Loading Sequence Planning）
+#
+# 与抗倾覆试算同一物理模型（各层板+坯为质点、底层落点凸包为支撑多边形），
+# 但装货场景改为：
+#   * 架体几何不变，全部棚板自重始终保留；
+#   * 先把所有层坯件重量置零，再把坯件重量大于零的层（候选层，至多
+#     MAX_LOAD_SEQ_LAYERS=12 个）按“整层坯件一次加入”的方式逐层装货；
+#   * 对每个已装子集（含坯件全部置零的初始状态）求抗倾覆带符号裕量；
+#   * 用位掩码动态规划求使「全过程最小裕量」最大的加入顺序；最优值相同
+#     时按层序号字典序（自下而上）选取，结果确定。
+#
+# 若最优顺序的全过程最小裕量仍非正（<= OVERTURN_EPS_MM），标记
+# allStable=False（无法全程稳定）。前置条件不足（无有效承托 / 底层支撑
+# 凸包退化 / 初始棚板总重为零 / 无层 / 候选层超过 12 / 没有可装层）时
+# 明确返回 planable=False 与原因，不做规划。
+# --------------------------------------------------------------------------
+MAX_LOAD_SEQ_LAYERS = 12
+
+
+def loading_sequence(
+    raw_state: Optional[Dict[str, Any]], ax: Any, ay: Any
+) -> Dict[str, Any]:
+    """逐层装货顺序规划：最大化全过程最小抗倾覆裕量的整层装货顺序。
+
+    参数
+    ----
+    raw_state : 当前架体输入（不被修改、不被持久化）
+    ax, ay    : 水平加速度分量（单位 g，可正可负）；非有限数值抛 ValueError
+
+    返回
+    ----
+    planable=True 时给出候选层清单、初始（坯件全零）裕量/判定、动态规划求得
+    的最优顺序 steps（每步新增层、累计坯件重量、总重、重心、投影、带符号
+    裕量与稳定判定）、最优顺序（层索引）、全过程最小裕量 minMargin 与
+    allStable（每步裕量均 > EPS 才为 True）。
+    planable=False 时 reason 说明原因：无层 / 任一层无有效承托 / 凸包退化 /
+    初始棚板总重为 0 / 候选层超过 12 / 没有坯件重量大于零的层。
+    """
+    axv, ayv = _parse_accel_g(ax, ay)
+
+    norm = normalize(raw_state)
+    layers = norm["layers"]
+    n = len(layers)
+
+    candidate_idx = [i for i, L in enumerate(layers) if L["wareWeight"] > 0.0]
+    m = len(candidate_idx)
+
+    # 与 overturn_check 一致的几何/重量前置检查（坯件全部保留时评估承托与凸包；
+    # 承托有效性只取决于几何，与重量无关）
+    unsupported: List[Dict[str, Any]] = []
+    bottom_points: List[Tuple[float, float, str]] = []
+    for i, L in enumerate(layers):
+        rect = _support_rect_for(norm, i)
+        valid_posts = [p for p in L["posts"] if in_rect(p["x"], p["y"], rect)]
+        if not valid_posts:
+            unsupported.append(
+                {
+                    "index": i,
+                    "name": L["name"],
+                    "postCount": len(L["posts"]),
+                    "validCount": 0,
+                }
+            )
+        if i == 0:
+            bottom_points = [(p["x"], p["y"], p["id"]) for p in valid_posts]
+
+    candidate_rows = [
+        {
+            "index": i,
+            "id": layers[i]["id"],
+            "name": layers[i]["name"],
+            "wareWeight": r2(layers[i]["wareWeight"]),
+        }
+        for i in candidate_idx
+    ]
+
+    def fail(reason: str) -> Dict[str, Any]:
+        return {
+            "planable": False,
+            "reason": reason,
+            "ax": round(axv, 6),
+            "ay": round(ayv, 6),
+            "candidateCount": m,
+            "candidateLimit": MAX_LOAD_SEQ_LAYERS,
+            "candidates": candidate_rows,
+            "unsupportedLayers": unsupported,
+            "polygon": None,
+            "order": None,
+            "steps": None,
+            "initial": None,
+            "minMargin": None,
+            "allStable": False,
+        }
+
+    if n == 0:
+        return fail("当前架体没有任何层，无法规划逐层装货顺序")
+
+    if unsupported:
+        names = "、".join(
+            f"{u['name']}（录入 {u['postCount']} 根立柱，有效承托 0 根）"
+            for u in unsupported
+        )
+        return fail(
+            f"以下 {len(unsupported)} 层无有效承托（立柱均悬空或未录入），"
+            f"整架传力不完整，无法规划逐层装货顺序：{names}"
+        )
+
+    hull = _convex_hull([(x, y) for x, y, _ in bottom_points])
+    unique_n = len({(x, y) for x, y, _ in bottom_points})
+    hull_area = abs(_polygon_area2(hull)) / 2.0
+    if len(hull) < 3 or hull_area <= OVERTURN_EPS_MM:
+        return fail(
+            f"底层非悬空立柱落点 {len(bottom_points)} 个（去重后 {unique_n} 个），"
+            "不足以形成非零面积的支撑多边形（至少需要 3 个不共线落点），"
+            "无法规划逐层装货顺序"
+        )
+
+    # 初始（坯件全部置零）时必须仍有重量（棚板自重）才能求重心
+    board_weight_total = sum(L["board"]["weight"] for L in layers)
+    if board_weight_total <= 0.0:
+        return fail(
+            "初始棚板总重为 0：坯件全部置零后整架没有重量，无法求重心，"
+            "不能规划逐层装货顺序（请先录入棚板自重）"
+        )
+
+    if m > MAX_LOAD_SEQ_LAYERS:
+        return fail(
+            f"共有 {m} 个坯件重量大于零的层，超过逐层装货顺序规划上限 "
+            f"{MAX_LOAD_SEQ_LAYERS} 层，请缩减规划范围（将部分层坯件重量置零）"
+            "后重试"
+        )
+
+    if m == 0:
+        return fail(
+            "当前没有坯件重量大于零的层，所有层均已处于无坯件状态，"
+            "无需规划装货顺序"
+        )
+
+    # ---- 各层质点常量（与 overturn_check 完全一致） ----
+    z_at = [0.0] * n           # 累计高度 H_i
+    cx_at = [0.0] * n          # 棚板中心 x
+    cy_at = [0.0] * n          # 棚板中心 y
+    bw_at = [0.0] * n          # 棚板自重
+    ww_at = [0.0] * n          # 坯件重量
+    cum_z = 0.0
+    for i, L in enumerate(layers):
+        b = L["board"]
+        cum_z += L["height"]
+        z_at[i] = cum_z
+        cx_at[i] = b["x"] + b["w"] / 2.0
+        cy_at[i] = b["y"] + b["d"] / 2.0
+        bw_at[i] = b["weight"]
+        ww_at[i] = L["wareWeight"]
+
+    # 坯件全零时的一次矩常量（所有子集共享）
+    base_w = board_weight_total
+    base_sx = sum(bw_at[i] * cx_at[i] for i in range(n))
+    base_sy = sum(bw_at[i] * cy_at[i] for i in range(n))
+    base_sz = sum(bw_at[i] * z_at[i] for i in range(n))
+
+    # 每个候选层坯件加入后对一次矩与重量的增量
+    dW = [ww_at[i] for i in candidate_idx]
+    dSX = [ww_at[i] * cx_at[i] for i in candidate_idx]
+    dSY = [ww_at[i] * cy_at[i] for i in candidate_idx]
+    dSZ = [ww_at[i] * z_at[i] for i in candidate_idx]
+
+    def subset_margin(mask: int) -> Tuple[float, float, float, float, float, float]:
+        """已装候选层集合 mask 下的（带符号裕量, 总重, Gx, Gy, Gz, 累计坯件重）。
+
+        各量按固定顺序（候选层序号升序）累加，保证同一子集结果逐位确定。
+        """
+        tw = base_w
+        sx, sy, sz = base_sx, base_sy, base_sz
+        ware_sum = 0.0
+        for k in range(m):
+            if mask & (1 << k):
+                tw += dW[k]
+                sx += dSX[k]
+                sy += dSY[k]
+                sz += dSZ[k]
+                ware_sum += dW[k]
+        gx, gy, gz = sx / tw, sy / tw, sz / tw
+        px, py = gx + axv * gz, gy + ayv * gz
+        margin = _signed_distance_to_polygon(px, py, hull)
+        return margin, tw, gx, gy, gz, ware_sum
+
+    # 每个子集只算一次（DP 中同一掩码会被多个前驱访问；至多 2^12=4096 个子集）
+    margin_cache: List[Tuple[float, float, float, float, float, float]] = [
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    ] * (1 << m)
+    cache_done = [False] * (1 << m)
+
+    def cached_subset(mask: int):
+        if not cache_done[mask]:
+            margin_cache[mask] = subset_margin(mask)
+            cache_done[mask] = True
+        return margin_cache[mask]
+
+    def verdict_of(margin: float) -> str:
+        if margin > OVERTURN_EPS_MM:
+            return "stable"
+        if margin < -OVERTURN_EPS_MM:
+            return "overturn"
+        return "critical"
+
+    # ---- 位掩码动态规划：最大化全过程（含初始状态）最小裕量 ----
+    # best[mask] = (minMargin, order_tuple)：从初始状态装成 mask 这一过程中
+    # 初始裕量与各步裕量的最小值；同分按层序号字典序（层索引元组字典序）。
+    # 掩码按数值递增枚举即保证子集先于超集被处理。
+    init_margin = cached_subset(0)[0]
+    best: Dict[int, Tuple[float, Tuple[int, ...]]] = {0: (init_margin, ())}
+    for mask in range(1, 1 << m):
+        best_val = -math.inf
+        best_order: Optional[Tuple[int, ...]] = None
+        margin = cached_subset(mask)[0]
+        bits = mask
+        while bits:
+            lb = bits & -bits
+            k = lb.bit_length() - 1
+            prev = mask ^ lb
+            prev_val, prev_order = best[prev]
+            val = min(prev_val, margin)
+            order = prev_order + (candidate_idx[k],)
+            if val > best_val or (val == best_val and
+                                 (best_order is None or order < best_order)):
+                best_val = val
+                best_order = order
+            bits ^= lb
+        best[mask] = (best_val, best_order)  # type: ignore[assignment]
+
+    full_mask = (1 << m) - 1
+    min_margin, order_idx = best[full_mask]
+
+    # ---- 逐步明细（初始坯件全零 + 每加入一层） ----
+    def step_row(
+        step_no: int,
+        added: Optional[int],
+        margin: float,
+        tw: float,
+        gx: float,
+        gy: float,
+        gz: float,
+        ware_sum: float,
+    ) -> Dict[str, Any]:
+        v = verdict_of(margin)
+        return {
+            "step": step_no,
+            "addedIndex": added,
+            "addedId": layers[added]["id"] if added is not None else None,
+            "addedName": layers[added]["name"] if added is not None else None,
+            "addedWareWeight": r2(ww_at[added]) if added is not None else 0.0,
+            "cumulativeWareWeight": r2(ware_sum),
+            "totalWeight": r2(tw),
+            "cg": {"x": r2(gx), "y": r2(gy), "z": r2(gz)},
+            "projection": {
+                "x": r2(gx + axv * gz),
+                "y": r2(gy + ayv * gz),
+            },
+            "margin": r2(margin),
+            "verdict": v,
+            "stable": v == "stable",
+        }
+
+    m0, tw0, gx0, gy0, gz0, _ = cached_subset(0)
+    steps = [step_row(0, None, m0, tw0, gx0, gy0, gz0, 0.0)]
+    mask = 0
+    for step_no, li in enumerate(order_idx, start=1):
+        k = candidate_idx.index(li)
+        mask |= 1 << k
+        mv, tw, gx, gy, gz, ware_sum = cached_subset(mask)
+        steps.append(step_row(step_no, li, mv, tw, gx, gy, gz, ware_sum))
+
+    all_stable = all(s["stable"] for s in steps)
+
+    sp_map: Dict[Tuple[float, float], List[str]] = {}
+    for x, y, pid in bottom_points:
+        sp_map.setdefault((x, y), []).append(pid)
+    support_points = [
+        {"x": r2(x), "y": r2(y), "posts": ids}
+        for (x, y), ids in sorted(sp_map.items())
+    ]
+
+    return {
+        "planable": True,
+        "reason": None,
+        "ax": round(axv, 6),
+        "ay": round(ayv, 6),
+        "candidateCount": m,
+        "candidateLimit": MAX_LOAD_SEQ_LAYERS,
+        "candidates": candidate_rows,
+        "unsupportedLayers": [],
+        "polygon": [{"x": r2(x), "y": r2(y)} for x, y in hull],
+        "supportPoints": support_points,
+        "supportPointCount": len(bottom_points),
+        "order": list(order_idx),
+        "steps": steps,
+        "initial": steps[0],
+        "minMargin": r2(min_margin),
+        "minMarginStep": min(
+            steps, key=lambda s: (s["margin"], s["step"])
+        )["step"],
+        "allStable": all_stable,
     }

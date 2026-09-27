@@ -388,6 +388,21 @@ ul.sug-issues li.is-removed .itype { color: var(--normal); }
 }
 .ov-reason b { color: var(--warn); }
 
+/* ---------- 逐层装货顺序规划 ---------- */
+.seq-panel { border-style: dashed; border-color: #5a4a9a; }
+.seq-panel .btn-run { border-color: #9d7bff; color: #9d7bff; }
+.seq-panel .btn-run:hover { background: rgba(157,123,255,0.12); }
+.badge.has-seq { color: #9d7bff; border-color: #9d7bff; }
+.badge.has-seq.all-stable { color: var(--normal); border-color: var(--normal); }
+.seq-form { max-width: 360px; }
+.seq-table td { vertical-align: top; }
+.seq-table td small { color: var(--muted); font-size: 10px; }
+.seq-table td.good { color: var(--normal); }
+.seq-table td.warn { color: var(--warn); }
+.seq-table td.bad { color: var(--error); }
+.ov-verdict.stable b { color: var(--normal); }
+.ov-verdict.overturn b { color: var(--error); }
+
 @media (max-width: 1200px) {
   .layout { grid-template-columns: 330px 1fr; }
   .views { grid-template-columns: 1fr; }

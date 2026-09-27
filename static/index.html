@@ -175,6 +175,35 @@
         <div id="overturnOutput"></div>
       </div>
 
+      <div class="panel seq-panel">
+        <div class="sim-head">
+          <h2>🚚 逐层装货顺序规划 <span id="seqStatus" class="badge">未规划</span></h2>
+          <div class="suggest-actions">
+            <button id="btnCancelSeq" class="btn btn-ghost" type="button" disabled>✕ 清空规划</button>
+            <button id="btnSeq" class="btn btn-run" type="button">开始装货顺序规划</button>
+          </div>
+        </div>
+        <p class="hint">
+          以<b>当前架体</b>为准、<b>保留全部棚板自重</b>：先把所有层坯件重量置零，再把
+          <b>坯件重量大于零的层（至多 12 层）</b>按<b>整层坯件一次加入</b>模拟装货，
+          对每个已装子集用与抗倾覆试算相同的模型计算<b>带符号裕量</b>，并用动态规划找出
+          「<b>全过程最小裕量最大</b>」的加入顺序（同分按<b>层序号字典序</b>自下而上选取）。
+          输入水平加速度 x/y 分量（单位 <b>g</b>）。面板逐步列出新增层、累计坯件重量、裕量与
+          稳定判定；若<b>最优顺序仍有非正裕量</b>，会标明无法全程稳定。规划<span class="hl">只读不写盘</span>；
+          无有效承托、底层支撑凸包退化或初始棚板总重为零时无法规划，候选层超过 12 层会提示缩减范围；
+          <b>编辑架体后旧结果立即作废</b>。
+        </p>
+        <div class="overturn-form seq-form">
+          <label>水平加速度 ax (g)
+            <input type="number" step="any" id="seqAx" value="0.1" />
+          </label>
+          <label>水平加速度 ay (g)
+            <input type="number" step="any" id="seqAy" value="0" />
+          </label>
+        </div>
+        <div id="seqOutput"></div>
+      </div>
+
       <div class="bottom-grid">
         <div class="panel issues-panel">
           <h2>告警与判定 <span id="issueCount" class="badge"></span></h2>

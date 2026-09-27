@@ -21,6 +21,12 @@ POST /api/overturn   层架抗倾覆试算：body {"state"(可省), "ax": 0.1, "
                      为支撑多边形，把重心投影按 (ax, ay)·重心高度平移后计算到凸包
                      边界的带符号最短距离，判定稳定/临界/倾覆；只计算，不写盘；
                      落点不足以形成非零面积或任一层无有效承托时返回 evaluable=false
+POST /api/loading-sequence
+                     逐层装货顺序规划：body {"state"(可省), "ax": 0.1, "ay": 0}，
+                     保留全部棚板自重、坯件先全部置零，再把坯件重量大于零的层
+                     （至多 12 层）按整层一次加入；对各已装子集求抗倾覆带符号裕量，
+                     用动态规划求全过程最小裕量最大的装货顺序（同分按层序号字典序）；
+                     只计算，不写盘；前置条件不足或候选层超过 12 时返回 planable=false
 POST /api/reset      恢复内置示例数据
 """
 
@@ -32,7 +38,14 @@ import tempfile
 
 from flask import Flask, jsonify, request, send_from_directory
 
-from .calc import calculate, load_shed, overturn_check, simulate, suggest_posts
+from .calc import (
+    calculate,
+    load_shed,
+    loading_sequence,
+    overturn_check,
+    simulate,
+    suggest_posts,
+)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -66,6 +79,19 @@ def load_state():
     if not os.path.exists(STATE_FILE):
         _atomic_write_json(STATE_FILE, _read_json(SAMPLE_FILE))
     return _read_json(STATE_FILE)
+
+
+def ensure_initialized() -> None:
+    """容器/进程启动时完成初始化：状态文件缺失则立即由示例数据生成。
+
+    依赖已在镜像构建时装好；这里保证服务一旦启动，data/state.json
+    即存在且可读写，无需等待首次请求。
+    """
+    if not os.path.exists(STATE_FILE):
+        _atomic_write_json(STATE_FILE, _read_json(SAMPLE_FILE))
+
+
+ensure_initialized()
 
 
 @app.route("/")
@@ -168,6 +194,22 @@ def api_overturn():
     # 加速度分量非法（非数字）→ 400；几何条件不足（无承托/凸包退化）属于正常结果 → 200 + evaluable=false
     try:
         result = overturn_check(state, payload.get("ax", 0), payload.get("ay", 0))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"ok": True, **result})
+
+
+@app.route("/api/loading-sequence", methods=["POST"])
+def api_loading_sequence():
+    """逐层装货顺序规划：最大化全过程最小抗倾覆裕量。只计算，不写盘、不改已保存状态。"""
+    payload = request.get_json(force=True, silent=True)
+    payload = payload if isinstance(payload, dict) else {}
+    state = payload.get("state")
+    if not isinstance(state, dict):
+        state = load_state()
+    # 加速度分量非法（非数字）→ 400；前置条件不足（无承托/凸包退化/超 12 层等）属于正常结果 → 200 + planable=false
+    try:
+        result = loading_sequence(state, payload.get("ax", 0), payload.get("ay", 0))
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify({"ok": True, **result})

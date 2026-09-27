@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.calc import (  # noqa: E402
     calculate,
     load_shed,
+    loading_sequence,
     normalize,
     overturn_check,
     simulate,
@@ -1014,6 +1015,210 @@ class CalcTests(unittest.TestCase):
         r0 = overturn_check(state, 0, 0)
         self.assertEqual(r0["verdict"], "stable")
         self.assertGreater(r0["margin"], 0)
+
+    # ---------------- 逐层装货顺序规划 ----------------
+    def _seq_rack(self, board_offsets, wares, board_weights=None, height=300):
+        """n 层同尺寸（可整体平移 x）架体；四角有效柱，坯件重量逐层给定。"""
+        board_weights = board_weights or [100] * len(wares)
+        return {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": f"第{i + 1}层",
+                    "height": height,
+                    "board": {
+                        "x": off, "y": 0, "w": 1000, "d": 1000,
+                        "weight": bw,
+                    },
+                    "wareWeight": w,
+                    "posts": [
+                        {"id": "A", "x": 0, "y": 0, "capacity": 0},
+                        {"id": "B", "x": 1000, "y": 0, "capacity": 0},
+                        {"id": "C", "x": 0, "y": 1000, "capacity": 0},
+                        {"id": "D", "x": 1000, "y": 1000, "capacity": 0},
+                    ],
+                }
+                for i, (off, w, bw) in enumerate(
+                    zip(board_offsets, wares, board_weights)
+                )
+            ],
+        }
+
+    def test_loading_sequence_two_layers_light_low_first(self):
+        # 底层坯轻、顶层坯重且顶层棚板整体偏 +x：先装底层（低、居中）更安全
+        state = self._seq_rack([0, 200], [100, 800])
+        r = loading_sequence(state, 0.5, 0)
+        self.assertTrue(r["planable"])
+        self.assertEqual(r["candidateCount"], 2)
+        # 与两种顺序的独立整架计算对照
+        def margins(order):
+            s = json.loads(json.dumps(state))
+            for L in s["layers"]:
+                L["wareWeight"] = 0
+            vals = [overturn_check(s, 0.5, 0)["margin"]]
+            for i in order:
+                s["layers"][i]["wareWeight"] = state["layers"][i]["wareWeight"]
+                vals.append(overturn_check(s, 0.5, 0)["margin"])
+            return min(vals), vals
+
+        m01, vals01 = margins((0, 1))
+        m10, vals10 = margins((1, 0))
+        self.assertGreater(m01, m10)  # 先轻后低确实更优
+        self.assertEqual(r["order"], [0, 1])
+        self.assertAlmostEqual(r["minMargin"], m01, places=9)
+        # steps：初始（无坯）+ 每步新增一层
+        self.assertEqual(len(r["steps"]), 3)
+        self.assertIsNone(r["steps"][0]["addedIndex"])
+        self.assertEqual([s["addedIndex"] for s in r["steps"][1:]], [0, 1])
+        self.assertEqual(
+            [s["cumulativeWareWeight"] for s in r["steps"]], [0.0, 100.0, 900.0]
+        )
+        for got, exp in zip(
+            [s["margin"] for s in r["steps"]], vals01
+        ):
+            self.assertAlmostEqual(got, exp, places=9)
+        self.assertTrue(r["allStable"])
+        self.assertGreater(r["minMargin"], 0)
+
+    def test_loading_sequence_lexicographic_tie(self):
+        # 对称架体 + 轴对称载荷：任意顺序裕量相同 → 取层序号字典序 [0, 1, 2]
+        state = self._seq_rack([0, 0, 0], [100, 100, 100])
+        r = loading_sequence(state, 0.1, 0)
+        self.assertTrue(r["planable"])
+        self.assertEqual(r["order"], [0, 1, 2])
+        self.assertTrue(all(s["stable"] for s in r["steps"]))
+
+    def test_loading_sequence_nonpositive_margin_marks_unstable(self):
+        # 较大水平加速度：即便最优顺序，过程中仍会倾覆 → allStable=False
+        state = self._seq_rack([0, 200], [100, 800])
+        r = loading_sequence(state, 1.2, 0)
+        self.assertTrue(r["planable"])
+        self.assertFalse(r["allStable"])
+        self.assertLessEqual(r["minMargin"], 0)
+        # minMarginStep 指向取得最小裕量的步
+        self.assertEqual(
+            r["minMarginStep"],
+            min(r["steps"], key=lambda s: (s["margin"], s["step"]))["step"],
+        )
+
+    def test_loading_sequence_critical_is_not_stable(self):
+        # 初始静止时稳定；选一个让某一中间状态恰好临界的加速度 → allStable=False
+        # 单候选层：先求临界加速度（对加坯后的重心高度），再在该工况规划
+        state = self._seq_rack([0], [200])
+        # 板100、坯200：重心高 300，x 中心 500；临界 ax = 500/300
+        r = loading_sequence(state, 500.0 / 300.0, 0)
+        self.assertTrue(r["planable"])
+        self.assertFalse(r["allStable"])
+        self.assertEqual(r["minMargin"], 0.0)
+        verdicts = {s["step"]: s["verdict"] for s in r["steps"]}
+        self.assertEqual(verdicts[1], "critical")
+
+    def test_loading_sequence_zero_ware_layers_not_candidates(self):
+        state = self._seq_rack([0, 100, 0], [100, 0, 200])
+        r = loading_sequence(state, 0.1, 0)
+        self.assertTrue(r["planable"])
+        self.assertEqual(r["candidateCount"], 2)
+        self.assertEqual([c["index"] for c in r["candidates"]], [0, 2])
+        self.assertEqual(set(r["order"]), {0, 2})
+        # 中间层坯件始终为 0：每步总重只含板自重 + 已加坯件
+        self.assertEqual(r["steps"][0]["totalWeight"], 300.0)
+
+    def test_loading_sequence_no_candidate_not_planable(self):
+        state = self._seq_rack([0, 100], [0, 0])
+        r = loading_sequence(state, 0.1, 0)
+        self.assertFalse(r["planable"])
+        self.assertIsNone(r["order"])
+        self.assertIn("没有坯件重量大于零的层", r["reason"])
+
+    def test_loading_sequence_unsupported_not_planable(self):
+        with open(SAMPLE, encoding="utf-8") as f:
+            state = json.load(f)
+        state["layers"][1]["posts"] = []
+        r = loading_sequence(state, 0.1, 0)
+        self.assertFalse(r["planable"])
+        self.assertEqual([u["index"] for u in r["unsupportedLayers"]], [1])
+        self.assertIn("无有效承托", r["reason"])
+
+    def test_loading_sequence_degenerate_hull_not_planable(self):
+        state = self._seq_rack([0], [100])
+        state["layers"][0]["posts"] = [
+            {"id": "A", "x": 0, "y": 500, "capacity": 0},
+            {"id": "B", "x": 500, "y": 500, "capacity": 0},
+            {"id": "C", "x": 1000, "y": 500, "capacity": 0},
+        ]
+        r = loading_sequence(state, 0.1, 0)
+        self.assertFalse(r["planable"])
+        self.assertIn("支撑多边形", r["reason"])
+
+    def test_loading_sequence_zero_board_weight_not_planable(self):
+        state = self._seq_rack([0, 100], [100, 100], board_weights=[0, 0])
+        r = loading_sequence(state, 0.1, 0)
+        self.assertFalse(r["planable"])
+        self.assertIn("初始棚板总重为 0", r["reason"])
+
+    def test_loading_sequence_empty_rack_not_planable(self):
+        r = loading_sequence(
+            {"car": {"w": 1000, "d": 1000}, "layers": []}, 0.1, 0
+        )
+        self.assertFalse(r["planable"])
+        self.assertIn("没有任何层", r["reason"])
+
+    def test_loading_sequence_over_limit_not_planable(self):
+        posts = [
+            {"id": "A", "x": 0, "y": 0, "capacity": 0},
+            {"id": "B", "x": 1000, "y": 0, "capacity": 0},
+            {"id": "C", "x": 0, "y": 1000, "capacity": 0},
+            {"id": "D", "x": 1000, "y": 1000, "capacity": 0},
+        ]
+        state = {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": f"L{i}", "height": 300,
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 100},
+                    "wareWeight": 100, "posts": posts,
+                }
+                for i in range(13)
+            ],
+        }
+        r = loading_sequence(state, 0.1, 0)
+        self.assertFalse(r["planable"])
+        self.assertEqual(r["candidateCount"], 13)
+        self.assertEqual(r["candidateLimit"], 12)
+        self.assertIn("12 层", r["reason"])
+        self.assertIn("缩减", r["reason"])
+        # 恰好 12 层：可规划
+        state["layers"] = state["layers"][:12]
+        r12 = loading_sequence(state, 0.1, 0)
+        self.assertTrue(r12["planable"])
+        self.assertEqual(len(r12["order"]), 12)
+
+    def test_loading_sequence_invalid_accel_raises(self):
+        state = self._seq_rack([0], [100])
+        with self.assertRaises(ValueError):
+            loading_sequence(state, "x", 0)
+        with self.assertRaises(ValueError):
+            loading_sequence(state, 0, float("nan"))
+
+    def test_loading_sequence_does_not_mutate_input(self):
+        with open(SAMPLE, encoding="utf-8") as f:
+            state = json.load(f)
+        before = json.loads(json.dumps(state, ensure_ascii=False))
+        r = loading_sequence(state, 0.15, -0.1)
+        self.assertTrue(r["planable"])
+        self.assertEqual(state, before)
+        # 终态（全部坯件加入）与 overturn_check 完全一致
+        oc = overturn_check(state, 0.15, -0.1)
+        self.assertEqual(r["steps"][-1]["margin"], oc["margin"])
+        self.assertEqual(r["steps"][-1]["cg"], oc["cg"])
+        self.assertEqual(r["steps"][-1]["projection"], oc["projection"])
+        # 初态（坯件清零）与 overturn_check 清零工况一致
+        cleared = json.loads(json.dumps(state))
+        for L in cleared["layers"]:
+            L["wareWeight"] = 0
+        oc0 = overturn_check(cleared, 0.15, -0.1)
+        self.assertEqual(r["steps"][0]["margin"], oc0["margin"])
+        self.assertEqual(r["steps"][0]["totalWeight"], oc0["totalWeight"])
 
 
 if __name__ == "__main__":
