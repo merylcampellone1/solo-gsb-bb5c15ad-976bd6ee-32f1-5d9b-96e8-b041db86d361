@@ -47,6 +47,15 @@ let overturnErr = null;        // 最近一次参数错误提示（400）
 let overturnTimer = null;      // 加速度输入变化后的防抖重算
 const OVERTURN_COLOR = "#46b8e8";
 
+/* ================= 逐层装货顺序规划状态 =================
+ * loadPlanData 只来自 POST /api/load-plan（或离线兜底），只读不写盘；
+ * 编辑架体后立即作废（invalidateLoadPlan），需要重新规划。
+ */
+let loadPlanData = null;       // 最近一次装货顺序规划结果
+let loadPlanSeq = 0;           // 规划请求序号，丢弃过期响应
+let loadPlanErr = null;        // 最近一次参数错误提示（400）
+let loadPlanTimer = null;      // 加速度输入变化后的防抖重算
+
 /* ================= 数值/工具 ================= */
 const $ = (sel) => document.querySelector(sel);
 const fmt = (v) => (Math.round(v * 100) / 100).toLocaleString("zh-CN", { maximumFractionDigits: 2 });
@@ -112,6 +121,8 @@ async function recalcAndRender(applyChange) {
   }
   // 抗倾覆试算只依赖架体几何/重量：加柱、减载确认写入同样会改变它，任何重算都作废
   invalidateOverturn({ silent: true });
+  // 装货顺序规划同样只读依赖架体：任何重算都作废旧规划
+  invalidateLoadPlan({ silent: true });
   suggestAppliedMsg = null;
   if (applyChange !== "shed") shedAppliedMsg = null;
   try {
@@ -369,6 +380,7 @@ $("#btnReset").addEventListener("click", async () => {
   invalidateSuggestions({ silent: true });
   invalidateShed({ silent: true });
   invalidateOverturn({ silent: true });
+  invalidateLoadPlan({ silent: true });
   suggestAppliedMsg = null;
   shedAppliedMsg = null;
   renderEditor(); renderResults(); markLayerBadges();
@@ -395,6 +407,7 @@ function renderResults() {
   renderSuggestPanel();
   renderShedPanel();
   renderOverturnPanel();
+  renderLoadPlanPanel();
 }
 
 function renderTotals() {
@@ -1718,6 +1731,194 @@ $("#btnCancelOverturn").addEventListener("click", cancelOverturn);
   });
 });
 
+/* ================= 逐层装货顺序规划面板 ================= */
+/* 架体发生编辑/重置：上次规划作废（规划只读，不存在确认写入） */
+function invalidateLoadPlan(opts) {
+  loadPlanData = null;
+  loadPlanErr = null;
+  loadPlanSeq++;
+  clearTimeout(loadPlanTimer);
+  if (!opts || !opts.silent) renderLoadPlanPanel();
+}
+
+function loadPlanInputs() {
+  const ax = parseFloat($("#loadPlanAx").value);
+  const ay = parseFloat($("#loadPlanAy").value);
+  if (!Number.isFinite(ax) || !Number.isFinite(ay)) {
+    throw new Error("水平加速度 x/y 分量必须是有限数值（单位 g，可为负）");
+  }
+  return { ax, ay };
+}
+
+async function runLoadPlan() {
+  if (!state) return;
+  let ax, ay;
+  try {
+    ({ ax, ay } = loadPlanInputs());
+  } catch (e) {
+    loadPlanData = null;
+    loadPlanErr = e.message;
+    renderLoadPlanPanel();
+    return;
+  }
+  const status = $("#loadPlanStatus");
+  loadPlanErr = null;
+  status.textContent = "规划中…";
+  status.className = "badge has-loadplan";
+  const seq = ++loadPlanSeq;
+  let data;
+  try {
+    const res = await fetch("/api/load-plan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ state, ax, ay }),
+    });
+    data = await res.json().catch(() => null);
+    if (!res.ok) {
+      if (seq !== loadPlanSeq) return;
+      loadPlanData = null;
+      loadPlanErr = (data && data.error) || `规划失败（HTTP ${res.status}）`;
+      renderLoadPlanPanel();
+      return;
+    }
+  } catch (e) {
+    try {
+      data = loadPlanLocal(state, ax, ay); // 离线兜底：与后端同一套算法
+    } catch (e2) {
+      if (seq !== loadPlanSeq) return;
+      loadPlanData = null;
+      loadPlanErr = e2.message;
+      renderLoadPlanPanel();
+      return;
+    }
+  }
+  if (seq !== loadPlanSeq) return; // 期间已有编辑/重置，丢弃过期响应
+  loadPlanData = data;
+  renderLoadPlanPanel();
+}
+
+function cancelLoadPlan() {
+  loadPlanData = null;
+  loadPlanErr = null;
+  loadPlanSeq++;
+  clearTimeout(loadPlanTimer);
+  renderLoadPlanPanel();
+}
+
+const LP_VERDICT_TEXT = { stable: "稳定", critical: "临界", overturn: "倾覆" };
+const LP_VERDICT_PILL = { stable: "ok", critical: "hang", overturn: "bad" };
+
+function lpVerdictPill(v) {
+  return `<span class="pill ${LP_VERDICT_PILL[v] || ""}">${LP_VERDICT_TEXT[v] || v}</span>`;
+}
+
+function renderLoadPlanPanel(errText) {
+  const out = $("#loadPlanOutput");
+  const status = $("#loadPlanStatus");
+  const btnCancel = $("#btnCancelLoadPlan");
+  if (!out) return;
+  const err = errText || loadPlanErr;
+  btnCancel.disabled = !loadPlanData && !err;
+
+  if (err) {
+    status.textContent = "参数有误";
+    status.className = "badge";
+    out.innerHTML = `<p class="ov-reason">⚠ ${escapeHtml(err)}</p>`;
+    return;
+  }
+  if (!loadPlanData) {
+    status.textContent = "未规划";
+    status.className = "badge";
+    out.innerHTML = `<p class="muted" style="margin:8px 0 0">填写水平加速度 x/y 分量（单位 g，0=静止）后点击「开始装货顺序规划」。
+      规划只读取当前架体、不写盘；编辑架体后旧规划立即作废。初始状态为全部棚板自重（坯件置零），
+      之后每步把一整层坯件加入，逐步给出累计坯件重量、抗倾覆裕量与稳定判定。</p>`;
+    return;
+  }
+
+  const d = loadPlanData;
+  if (!d.plannable) {
+    status.textContent = "无法规划";
+    status.className = "badge has-error";
+    out.innerHTML = `
+      <p class="ov-reason">🚫 <b>无法规划：</b>${escapeHtml(d.reason || "架体条件不足")}</p>
+      <p class="hint" style="margin:4px 0 0">
+        棚板自重合计 <b>${fmt(d.boardWeight)}</b> kg · 坯件合计 <b>${fmt(d.wareTotal)}</b> kg ·
+        坯件重量大于 0 的层 <b>${d.wareLayerCount}</b> 层（上限 ${d.maxWareLayers} 层）。
+      </p>`;
+    return;
+  }
+
+  status.textContent = d.allStable ? "全程稳定" : "无法全程稳定";
+  status.className = "badge has-loadplan " + (d.allStable ? "stable" : "unstable");
+
+  // 最优顺序链：初始 → 第X层 → …
+  const orderChips = [`<span class="lp-chip init">初始（仅棚板）</span>`]
+    .concat(d.steps.map((s) =>
+      `<span class="lp-chip" style="border-color:${LAYER_COLORS[s.layer % LAYER_COLORS.length]};color:${LAYER_COLORS[s.layer % LAYER_COLORS.length]}">${escapeHtml(s.layerName)}</span>`
+    )).join('<span class="lp-arrow">→</span>');
+
+  const minWhere = d.minMarginStep === 0
+    ? "初始状态"
+    : `第 ${d.minMarginStep} 步（装入${escapeHtml(d.steps[d.minMarginStep - 1].layerName)}后）`;
+
+  const banner = d.allStable
+    ? `<p class="lp-banner ok">✓ 按此顺序装货，全过程（含初始状态）各步裕量均为正，最小裕量 ${fmt(d.minMargin)} mm，出现在${minWhere}。</p>`
+    : `<p class="lp-banner bad">⚠ 已给出全过程最小裕量最大的装货顺序，但最小裕量仍为 <b>${fmt(d.minMargin)} mm</b>（非正，出现在${minWhere}）——任何装货顺序都无法全程保持稳定，请调整架体或减小水平加速度。</p>`;
+
+  const initRow = `
+    <tr class="${d.initial.verdict !== "stable" ? "lp-unstable" : ""}${d.minMarginStep === 0 ? " lp-min" : ""}">
+      <td>0</td>
+      <td>初始状态（全部坯件置零）${d.minMarginStep === 0 ? ' <em>最小裕量</em>' : ""}</td>
+      <td>—</td><td>0</td>
+      <td>${fmt(d.initial.totalWeight)}</td>
+      <td>${fmt(d.initial.margin)}</td>
+      <td>${lpVerdictPill(d.initial.verdict)}</td>
+    </tr>`;
+  const stepRows = d.steps.map((s) => `
+    <tr class="${s.verdict !== "stable" ? "lp-unstable" : ""}${s.step === d.minMarginStep ? " lp-min" : ""}">
+      <td>${s.step}</td>
+      <td><b style="color:${LAYER_COLORS[s.layer % LAYER_COLORS.length]}">${escapeHtml(s.layerName)}</b>${s.step === d.minMarginStep ? ' <em>最小裕量</em>' : ""}</td>
+      <td>+${fmt(s.wareAdded)}</td>
+      <td>${fmt(s.wareCum)}</td>
+      <td>${fmt(s.totalWeight)}</td>
+      <td>${fmt(s.margin)}</td>
+      <td>${lpVerdictPill(s.verdict)}</td>
+    </tr>`).join("");
+
+  out.innerHTML = `
+    ${banner}
+    <div class="ov-metrics">
+      <div class="ov-metric"><span>棚板自重合计（初始总重）</span><b>${fmt(d.boardWeight)}</b><small>kg</small></div>
+      <div class="ov-metric"><span>坯件合计 / 参与规划层数</span><b>${fmt(d.wareTotal)}</b><small>kg · ${d.wareLayerCount} 层</small></div>
+      <div class="ov-metric ${d.allStable ? "" : "bad"}"><span>全过程最小裕量</span><b>${fmt(d.minMargin)}</b><small>mm（正=稳定 / 0=临界 / 负=倾覆）</small></div>
+      <div class="ov-metric"><span>水平加速度</span><b>${fmt(d.ax)}, ${fmt(d.ay)}</b><small>g · 支撑凸包 ${d.polygon.length} 顶点</small></div>
+    </div>
+    <div class="sub-title">最优装货顺序（同分按层序号字典序）</div>
+    <div class="lp-order">${orderChips}</div>
+    <div class="ov-table-wrap">
+      <table class="src-table sug-table ov-table lp-table">
+        <tr class="head"><td>步骤</td><td>新增层</td><td>本步坯件 kg</td><td>累计坯件 kg</td><td>整架总重 kg</td><td>裕量 mm</td><td>判定</td></tr>
+        ${initRow}${stepRows}
+      </table>
+    </div>
+    <p class="hint" style="margin:2px 0 0">裕量为该步已装子集的重心投影（平移 加速度×重心高度）到底层支撑凸包边界的带符号最短距离；标「最小裕量」的行为全过程瓶颈。</p>`;
+}
+
+$("#btnLoadPlan").addEventListener("click", runLoadPlan);
+$("#btnCancelLoadPlan").addEventListener("click", cancelLoadPlan);
+// 修改加速度分量：已有规划时防抖重算（只重算规划，不触碰架体）；无规划时仅清参数错误提示
+["loadPlanAx", "loadPlanAy"].forEach((id) => {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.addEventListener("input", () => {
+    clearTimeout(loadPlanTimer);
+    loadPlanTimer = setTimeout(() => {
+      if (loadPlanData) runLoadPlan();
+      else if (loadPlanErr) { loadPlanErr = null; renderLoadPlanPanel(); }
+    }, 250);
+  });
+});
+
 /* ================= 画布随窗口缩放重绘 ================= */
 window.addEventListener("resize", debounce(() => { drawTop(); drawSide(); }, 150));
 
@@ -2429,5 +2630,246 @@ function overturnLocal(rawState, ax, ay) {
     polygon: hull.map(([x, y]) => ({ x: r2(x), y: r2(y) })),
     supportPoints, supportPointCount: bottomPoints.length,
     margin: r2(margin), verdict, unsupportedLayers: [], layers: layerRows,
+  };
+}
+
+/* ======================================================================
+ * 逐层装货顺序规划离线兜底：与 app/calc.py 的 load_plan 对齐（只读不存）
+ *
+ * 保留全部棚板自重、坯件置零为初始状态；坯件重量 > 0 的层（至多 12 层）按整层
+ * 一次加入。每个已装子集按 overturn 同一模型求带符号裕量；子集 DP 求
+ * 「全过程最小裕量最大」的装货顺序，同分按层序号字典序贪心重建。
+ * ==================================================================== */
+const MAX_LOAD_PLAN_WARE_LAYERS = 12;
+
+function loadPlanLocal(rawState, ax, ay) {
+  if (!Number.isFinite(ax)) throw new Error("水平加速度 x 分量必须是数值（单位 g）");
+  if (!Number.isFinite(ay)) throw new Error("水平加速度 y 分量必须是数值（单位 g）");
+  // 规范化（与 calculateLocal 同样的宽容规则）
+  const car = {
+    name: (rawState.car && rawState.car.name) || "窑车台面",
+    w: Math.max(0, num(rawState.car && rawState.car.w)),
+    d: Math.max(0, num(rawState.car && rawState.car.d)),
+  };
+  const layers = (rawState.layers || []).map((l0, idx) => {
+    const b0 = l0.board || {};
+    return {
+      id: l0.id || "L" + idx,
+      name: l0.name || "第" + (idx + 1) + "层",
+      height: Math.max(0, num(l0.height)),
+      board: { x: num(b0.x), y: num(b0.y), w: Math.max(0, num(b0.w)), d: Math.max(0, num(b0.d)), weight: Math.max(0, num(b0.weight)) },
+      wareWeight: Math.max(0, num(l0.wareWeight)),
+      posts: (l0.posts || []).map((p0, j) => ({ id: String(p0.id || "P" + (j + 1)), x: num(p0.x), y: num(p0.y), capacity: num(p0.capacity) })),
+    };
+  });
+  const n = layers.length;
+  const supportRect = (i) => i === 0
+    ? { x: 0, y: 0, w: car.w, d: car.d }
+    : { x: layers[i - 1].board.x, y: layers[i - 1].board.y, w: layers[i - 1].board.w, d: layers[i - 1].board.d };
+  const inRect = (x, y, rc) => x >= rc.x && x <= rc.x + rc.w && y >= rc.y && y <= rc.y + rc.d;
+  const EPS = 1e-6;
+
+  const names = [], zcum = [], cx = [], cy = [], bw = [], ww = [];
+  const unsupported = [];
+  let bottomPoints = [];
+  let acc = 0;
+  for (let i = 0; i < n; i++) {
+    const L = layers[i], b = L.board;
+    const rc = supportRect(i);
+    const valid = L.posts.filter((p) => inRect(p.x, p.y, rc));
+    if (!valid.length) unsupported.push({ index: i, name: L.name, postCount: L.posts.length });
+    if (i === 0) bottomPoints = valid.map((p) => [p.x, p.y]);
+    acc += L.height;
+    names.push(L.name);
+    zcum.push(acc);
+    cx.push(b.x + b.w / 2); cy.push(b.y + b.d / 2);
+    bw.push(b.weight); ww.push(L.wareWeight);
+  }
+  const boardTotal = bw.reduce((s, v) => s + v, 0);
+  const wareTotal = ww.reduce((s, v) => s + v, 0);
+  const wareLayers = [];
+  for (let i = 0; i < n; i++) if (ww[i] > 0) wareLayers.push(i);
+  const k = wareLayers.length;
+
+  const fail = (reason) => ({
+    ok: true, plannable: false, reason, ax: r2(ax), ay: r2(ay),
+    boardWeight: r2(boardTotal), wareTotal: r2(wareTotal),
+    wareLayerCount: k, maxWareLayers: MAX_LOAD_PLAN_WARE_LAYERS,
+    polygon: null, supportPointCount: bottomPoints.length,
+    initial: null, order: null, steps: null,
+    minMargin: null, minMarginStep: null, allStable: false,
+    unsupportedLayers: unsupported,
+  });
+
+  if (n === 0) return fail("当前架体没有任何层，无法规划装货顺序");
+  if (unsupported.length) {
+    const ns = unsupported.map((u) => `${u.name}（录入 ${u.postCount} 根立柱，有效承托 0 根）`).join("、");
+    return fail(`以下 ${unsupported.length} 层无有效承托（立柱均悬空或未录入），整架传力不完整，无法规划装货顺序：${ns}`);
+  }
+
+  // Andrew 单调链凸包（与 overturnLocal 一致）
+  const convexHull = (points) => {
+    const pts = [...new Map(points.map(([x, y]) => [x + "|" + y, [x, y]])).values()];
+    pts.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    if (pts.length <= 2) return pts;
+    const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    const lower = [];
+    pts.forEach((p) => {
+      while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+      lower.push(p);
+    });
+    const upper = [];
+    for (let i = pts.length - 1; i >= 0; i--) {
+      const p = pts[i];
+      while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+      upper.push(p);
+    }
+    lower.pop(); upper.pop();
+    return lower.concat(upper);
+  };
+  const hull = convexHull(bottomPoints);
+  let area2 = 0;
+  hull.forEach(([x0, y0], i) => {
+    const [x1, y1] = hull[(i + 1) % hull.length];
+    area2 += x0 * y1 - x1 * y0;
+  });
+  if (hull.length < 3 || Math.abs(area2) / 2 <= EPS) {
+    const uniq = new Set(bottomPoints.map(([x, y]) => x + "|" + y)).size;
+    return fail(`底层非悬空立柱落点 ${bottomPoints.length} 个（去重后 ${uniq} 个），支撑凸包退化为点或线段（至少需要 3 个不共线落点），无法规划装货顺序`);
+  }
+  if (boardTotal <= 0) {
+    return fail("全部棚板自重合计为 0：坯件置零后的初始状态整架无重量，无法按重量求整架重心，无法规划装货顺序");
+  }
+  if (k > MAX_LOAD_PLAN_WARE_LAYERS) {
+    return fail(`坯件重量大于 0 的层共 ${k} 层，超过装货顺序规划上限 ${MAX_LOAD_PLAN_WARE_LAYERS} 层（子集动态规划规模 2^${MAX_LOAD_PLAN_WARE_LAYERS} = ${1 << MAX_LOAD_PLAN_WARE_LAYERS}）；请缩减参与规划的坯件层数（例如将部分层的坯件重量置 0）后重试`);
+  }
+
+  // 初始状态（全部坯件置零）的重量矩
+  let baseSx = 0, baseSy = 0, baseSz = 0;
+  for (let i = 0; i < n; i++) {
+    baseSx += bw[i] * cx[i]; baseSy += bw[i] * cy[i]; baseSz += bw[i] * zcum[i];
+  }
+
+  // 子集坯件重量矩（lowbit 递推）
+  const size = 1 << k;
+  const sw = new Float64Array(size), sxA = new Float64Array(size);
+  const syA = new Float64Array(size), szA = new Float64Array(size);
+  for (let mask = 1; mask < size; mask++) {
+    const lsb = mask & (-mask);
+    const j = 31 - Math.clz32(lsb);
+    const prev = mask ^ lsb;
+    const li = wareLayers[j];
+    const w = ww[li];
+    sw[mask] = sw[prev] + w;
+    sxA[mask] = sxA[prev] + w * cx[li];
+    syA[mask] = syA[prev] + w * cy[li];
+    szA[mask] = szA[prev] + w * zcum[li];
+  }
+
+  // 带符号最短距离（逆时针凸包：内正/边界0/外负）
+  const signedDist = (px, py) => {
+    let inside = true, best = Infinity;
+    for (let i = 0; i < hull.length; i++) {
+      const [ax0, ay0] = hull[i];
+      const [bx0, by0] = hull[(i + 1) % hull.length];
+      const ex = bx0 - ax0, ey = by0 - ay0;
+      const cr = ex * (py - ay0) - ey * (px - ax0);
+      const el = Math.hypot(ex, ey);
+      if (cr < -EPS * Math.max(1, el)) inside = false;
+      const den = ex * ex + ey * ey;
+      let t = den > 0 ? ((px - ax0) * ex + (py - ay0) * ey) / den : 0;
+      t = Math.max(0, Math.min(1, t));
+      const dd = Math.hypot(px - (ax0 + t * ex), py - (ay0 + t * ey));
+      if (dd < best) best = dd;
+    }
+    return inside ? best : -best;
+  };
+
+  const stateView = (mask) => {
+    const total = boardTotal + sw[mask];
+    const gx = (baseSx + sxA[mask]) / total;
+    const gy = (baseSy + syA[mask]) / total;
+    const gz = (baseSz + szA[mask]) / total;
+    const px = gx + ax * gz, py = gy + ay * gz;
+    return { total, gx, gy, gz, px, py, m: signedDist(px, py) };
+  };
+
+  const margin = new Float64Array(size);
+  for (let mask = 0; mask < size; mask++) margin[mask] = stateView(mask).m;
+
+  // 子集 DP：g[mask] = 已装集合为 mask 时后续各步裕量下限的最优值
+  const full = size - 1;
+  const g = new Float64Array(size);
+  g[full] = Infinity;
+  for (let mask = full - 1; mask >= 0; mask--) {
+    let best = -Infinity;
+    for (let j = 0; j < k; j++) {
+      const bit = 1 << j;
+      if (mask & bit) continue;
+      const m2 = mask | bit;
+      const v = Math.min(margin[m2], g[m2]);
+      if (v > best) best = v;
+    }
+    g[mask] = best;
+  }
+  const bestMin = Math.min(margin[0], g[0]);
+
+  // 依最优值 V* 自 ∅ 贪心重建：每步取仍能达到 V* 的层序号最小者（字典序）
+  const tol = 1e-9 * Math.max(1, Math.abs(bestMin));
+  const path = [];
+  let mask = 0;
+  while (mask !== full) {
+    let advanced = false;
+    for (let j = 0; j < k; j++) {
+      const bit = 1 << j;
+      if (mask & bit) continue;
+      const m2 = mask | bit;
+      if (margin[m2] >= bestMin - tol && g[m2] >= bestMin - tol) {
+        path.push([wareLayers[j], m2]);
+        mask = m2;
+        advanced = true;
+        break;
+      }
+    }
+    if (!advanced) break; // 理论不可达
+  }
+
+  const verdictOf = (m) => (m > EPS ? "stable" : m < -EPS ? "overturn" : "critical");
+  const viewDict = (mk) => {
+    const v = stateView(mk);
+    return {
+      totalWeight: r2(v.total),
+      cg: { x: r2(v.gx), y: r2(v.gy), z: r2(v.gz) },
+      projection: { x: r2(v.px), y: r2(v.py) },
+      margin: r2(v.m),
+      verdict: verdictOf(v.m),
+    };
+  };
+  const initial = viewDict(0);
+  const steps = [];
+  let cum = 0, minMargin = initial.margin, minStep = 0;
+  path.forEach(([li, m2], idx) => {
+    const v = viewDict(m2);
+    cum += ww[li];
+    if (v.margin < minMargin) { minMargin = v.margin; minStep = idx + 1; }
+    steps.push({
+      step: idx + 1, layer: li, layerName: names[li],
+      wareAdded: r2(ww[li]), wareCum: r2(cum), ...v,
+    });
+  });
+
+  return {
+    ok: true, plannable: true, reason: null, ax: r2(ax), ay: r2(ay),
+    boardWeight: r2(boardTotal), wareTotal: r2(wareTotal),
+    wareLayerCount: k, maxWareLayers: MAX_LOAD_PLAN_WARE_LAYERS,
+    polygon: hull.map(([x, y]) => ({ x: r2(x), y: r2(y) })),
+    supportPointCount: bottomPoints.length,
+    initial,
+    order: path.map(([li]) => li),
+    steps,
+    minMargin: r2(minMargin),
+    minMarginStep: minStep,
+    allStable: minMargin > EPS,
+    unsupportedLayers: [],
   };
 }

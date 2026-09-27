@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.calc import (  # noqa: E402
     calculate,
+    load_plan,
     load_shed,
     normalize,
     overturn_check,
@@ -1014,6 +1015,377 @@ class CalcTests(unittest.TestCase):
         r0 = overturn_check(state, 0, 0)
         self.assertEqual(r0["verdict"], "stable")
         self.assertGreater(r0["margin"], 0)
+
+    # ---------------- 逐层装货顺序规划 ----------------
+    def _plan_rack_two_ware_layers(self):
+        # 底层板居中、顶层板偏右：先装底层（居中）再装顶层的顺序明显更优
+        return {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "height": 300,
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 100},
+                    "wareWeight": 400,
+                    "posts": [
+                        {"id": "A", "x": 0, "y": 0, "capacity": 0},
+                        {"id": "B", "x": 1000, "y": 0, "capacity": 0},
+                        {"id": "C", "x": 0, "y": 1000, "capacity": 0},
+                        {"id": "D", "x": 1000, "y": 1000, "capacity": 0},
+                    ],
+                },
+                {
+                    "name": "顶",
+                    "height": 300,
+                    "board": {"x": 800, "y": 0, "w": 200, "d": 1000, "weight": 100},
+                    "wareWeight": 400,
+                    "posts": [
+                        {"id": "E", "x": 850, "y": 200, "capacity": 0},
+                        {"id": "F", "x": 950, "y": 800, "capacity": 0},
+                    ],
+                },
+            ],
+        }
+
+    def test_load_plan_picks_better_order(self):
+        r = load_plan(self._plan_rack_two_ware_layers(), 0, 0)
+        self.assertTrue(r["plannable"])
+        self.assertIsNone(r["reason"])
+        self.assertEqual(r["wareLayerCount"], 2)
+        self.assertEqual(r["boardWeight"], 200.0)
+        self.assertEqual(r["wareTotal"], 800.0)
+        # 初始（仅棚板）：重心 x=700 → 裕量 300
+        self.assertEqual(r["initial"]["margin"], 300.0)
+        self.assertEqual(r["initial"]["verdict"], "stable")
+        # 最优顺序：先装底层（{0} 裕量 433.33）再装顶层（满装 300）；
+        # 反顺序首步 {1} 裕量仅 166.67 → DP 选 [0, 1]
+        self.assertEqual(r["order"], [0, 1])
+        self.assertEqual(len(r["steps"]), 2)
+        s1, s2 = r["steps"]
+        self.assertEqual((s1["layer"], s1["wareAdded"], s1["wareCum"]), (0, 400.0, 400.0))
+        self.assertAlmostEqual(s1["margin"], 433.33, places=2)
+        self.assertEqual(s1["verdict"], "stable")
+        self.assertEqual((s2["layer"], s2["wareAdded"], s2["wareCum"]), (1, 400.0, 800.0))
+        self.assertEqual(s2["margin"], 300.0)
+        self.assertEqual(s2["totalWeight"], 1000.0)
+        # 全过程最小裕量 300（初始与第 2 步并列，取先出现的初始状态）
+        self.assertEqual(r["minMargin"], 300.0)
+        self.assertEqual(r["minMarginStep"], 0)
+        self.assertTrue(r["allStable"])
+
+    def test_load_plan_tie_breaks_by_layer_index(self):
+        # 两个坯件层重心完全相同（同板心、同坯件）：任意顺序裕量全等 → 按层序号字典序
+        state = {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "height": 300,
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 100},
+                    "wareWeight": 0,
+                    "posts": [
+                        {"id": "A", "x": 0, "y": 0, "capacity": 0},
+                        {"id": "B", "x": 1000, "y": 0, "capacity": 0},
+                        {"id": "C", "x": 0, "y": 1000, "capacity": 0},
+                        {"id": "D", "x": 1000, "y": 1000, "capacity": 0},
+                    ],
+                },
+                {
+                    "name": "中",
+                    "height": 300,
+                    "board": {"x": 300, "y": 300, "w": 400, "d": 400, "weight": 100},
+                    "wareWeight": 100,
+                    "posts": [
+                        {"id": "E", "x": 400, "y": 400, "capacity": 0},
+                        {"id": "F", "x": 600, "y": 600, "capacity": 0},
+                    ],
+                },
+                {
+                    "name": "顶",
+                    "height": 300,
+                    "board": {"x": 200, "y": 200, "w": 600, "d": 600, "weight": 100},
+                    "wareWeight": 100,
+                    "posts": [
+                        {"id": "G", "x": 350, "y": 350, "capacity": 0},
+                        {"id": "H", "x": 650, "y": 650, "capacity": 0},
+                    ],
+                },
+            ],
+        }
+        r = load_plan(state, 0, 0)
+        self.assertTrue(r["plannable"])
+        self.assertEqual(r["order"], [1, 2])  # 同分 → 层序号升序
+        # 所有状态重心都在 (500,500)：裕量恒为 500
+        self.assertEqual(r["initial"]["margin"], 500.0)
+        self.assertTrue(all(s["margin"] == 500.0 for s in r["steps"]))
+        self.assertEqual(r["minMargin"], 500.0)
+        self.assertTrue(r["allStable"])
+
+    def test_load_plan_marks_unstable_when_best_order_still_nonpositive(self):
+        # 顶层板重心远偏右侧（x=1100，悬出台面）：任何顺序满装后裕量都为负
+        state = {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "height": 300,
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 100},
+                    "wareWeight": 100,
+                    "posts": [
+                        {"id": "A", "x": 0, "y": 0, "capacity": 0},
+                        {"id": "B", "x": 1000, "y": 0, "capacity": 0},
+                        {"id": "C", "x": 0, "y": 1000, "capacity": 0},
+                        {"id": "D", "x": 1000, "y": 1000, "capacity": 0},
+                    ],
+                },
+                {
+                    "name": "顶",
+                    "height": 300,
+                    "board": {"x": 1075, "y": 0, "w": 50, "d": 1000, "weight": 100},
+                    "wareWeight": 2000,
+                    "posts": [{"id": "E", "x": 900, "y": 500, "capacity": 0}],
+                },
+            ],
+        }
+        r = load_plan(state, 0, 0)
+        self.assertTrue(r["plannable"])
+        # 先装底层（{0} 裕量 300）再装顶层（满装 -47.83）优于反顺序（首步 -72.73）
+        self.assertEqual(r["order"], [0, 1])
+        self.assertAlmostEqual(r["minMargin"], -47.83, places=2)
+        self.assertEqual(r["minMarginStep"], 2)
+        self.assertFalse(r["allStable"])  # 最优顺序仍有非正裕量 → 无法全程稳定
+        self.assertEqual(r["steps"][1]["verdict"], "overturn")
+        self.assertEqual(r["initial"]["verdict"], "stable")
+
+    def test_load_plan_acceleration_shifts_projection(self):
+        # 单层：重心高 300，ax=1.0 → 投影平移 300，裕量 500-300=200
+        state = {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "height": 300,
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 100},
+                    "wareWeight": 100,
+                    "posts": [
+                        {"id": "A", "x": 0, "y": 0, "capacity": 0},
+                        {"id": "B", "x": 1000, "y": 0, "capacity": 0},
+                        {"id": "C", "x": 0, "y": 1000, "capacity": 0},
+                        {"id": "D", "x": 1000, "y": 1000, "capacity": 0},
+                    ],
+                }
+            ],
+        }
+        r = load_plan(state, 1.0, 0)
+        self.assertTrue(r["plannable"])
+        self.assertEqual(r["order"], [0])
+        self.assertEqual(r["initial"]["margin"], 200.0)
+        self.assertEqual(r["steps"][0]["margin"], 200.0)
+        self.assertEqual(r["steps"][0]["projection"]["x"], 800.0)
+        self.assertEqual(r["minMargin"], 200.0)
+        self.assertTrue(r["allStable"])
+
+    def test_load_plan_dp_matches_brute_force(self):
+        # 4 个坯件层 + 非零加速度：与 24 种排列暴力枚举（以 overturn_check 为预言机）对比
+        import itertools
+
+        state = {
+            "car": {"w": 1200, "d": 900},
+            "layers": [
+                {
+                    "name": "L0", "height": 300,
+                    "board": {"x": 0, "y": 0, "w": 1200, "d": 900, "weight": 150},
+                    "wareWeight": 200,
+                    "posts": [
+                        {"id": "A", "x": 100, "y": 100, "capacity": 0},
+                        {"id": "B", "x": 1100, "y": 100, "capacity": 0},
+                        {"id": "C", "x": 100, "y": 800, "capacity": 0},
+                        {"id": "D", "x": 1100, "y": 800, "capacity": 0},
+                    ],
+                },
+                {
+                    "name": "L1", "height": 280,
+                    "board": {"x": 100, "y": 50, "w": 900, "d": 700, "weight": 120},
+                    "wareWeight": 300,
+                    "posts": [
+                        {"id": "E", "x": 200, "y": 150, "capacity": 0},
+                        {"id": "F", "x": 900, "y": 650, "capacity": 0},
+                    ],
+                },
+                {
+                    "name": "L2", "height": 260,
+                    "board": {"x": 200, "y": 100, "w": 700, "d": 500, "weight": 100},
+                    "wareWeight": 150,
+                    "posts": [
+                        {"id": "G", "x": 300, "y": 200, "capacity": 0},
+                        {"id": "H", "x": 800, "y": 500, "capacity": 0},
+                    ],
+                },
+                {
+                    "name": "L3", "height": 240,
+                    "board": {"x": 300, "y": 150, "w": 500, "d": 400, "weight": 80},
+                    "wareWeight": 250,
+                    "posts": [
+                        {"id": "I", "x": 400, "y": 250, "capacity": 0},
+                        {"id": "J", "x": 700, "y": 450, "capacity": 0},
+                    ],
+                },
+            ],
+        }
+        ax, ay = 0.15, -0.05
+        r = load_plan(state, ax, ay)
+        self.assertTrue(r["plannable"])
+        ware_layers = [0, 1, 2, 3]
+
+        def margin_of(subset):
+            s2 = json.loads(json.dumps(state))
+            for i in ware_layers:
+                if i not in subset:
+                    s2["layers"][i]["wareWeight"] = 0
+            return overturn_check(s2, ax, ay)["margin"]
+
+        m_empty = margin_of(set())
+        best = -1e18
+        best_perms = []
+        for perm in itertools.permutations(ware_layers):
+            cur = set()
+            mm = m_empty
+            for li in perm:
+                cur.add(li)
+                mm = min(mm, margin_of(cur))
+            if mm > best + 1e-9:
+                best = mm
+                best_perms = [perm]
+            elif abs(mm - best) <= 1e-9:
+                best_perms.append(perm)
+        # DP 的最小裕量与暴力枚举一致
+        self.assertAlmostEqual(r["minMargin"], best, places=1)
+        # DP 给出的顺序达到该最优值，且为同分下字典序最小
+        self.assertEqual(tuple(r["order"]), min(best_perms))
+        # 逐步明细与预言机逐步一致
+        cur = set()
+        for s in r["steps"]:
+            cur.add(s["layer"])
+            self.assertAlmostEqual(s["margin"], margin_of(cur), places=1)
+        # 累计坯件重量收敛到全部坯件
+        self.assertEqual(r["steps"][-1]["wareCum"], r["wareTotal"])
+
+    def test_load_plan_too_many_ware_layers_asks_to_reduce_scope(self):
+        layers = []
+        for i in range(13):
+            layers.append(
+                {
+                    "name": f"L{i}",
+                    "height": 200,
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 50},
+                    "wareWeight": 10,
+                    "posts": (
+                        [
+                            {"id": "A", "x": 0, "y": 0, "capacity": 0},
+                            {"id": "B", "x": 1000, "y": 0, "capacity": 0},
+                            {"id": "C", "x": 0, "y": 1000, "capacity": 0},
+                            {"id": "D", "x": 1000, "y": 1000, "capacity": 0},
+                        ]
+                        if i == 0
+                        else [{"id": "P", "x": 500, "y": 500, "capacity": 0}]
+                    ),
+                }
+            )
+        r = load_plan({"car": {"w": 1000, "d": 1000}, "layers": layers}, 0, 0)
+        self.assertFalse(r["plannable"])
+        self.assertEqual(r["wareLayerCount"], 13)
+        self.assertEqual(r["maxWareLayers"], 12)
+        self.assertIn("12", r["reason"])
+        self.assertIn("缩减", r["reason"])
+        self.assertIsNone(r["steps"])
+
+    def test_load_plan_zero_board_weight_not_plannable(self):
+        state = {
+            "car": {"w": 1000, "d": 1000},
+            "layers": [
+                {
+                    "name": "底",
+                    "board": {"x": 0, "y": 0, "w": 1000, "d": 1000, "weight": 0},
+                    "wareWeight": 100,
+                    "posts": [
+                        {"id": "A", "x": 0, "y": 0, "capacity": 0},
+                        {"id": "B", "x": 1000, "y": 0, "capacity": 0},
+                        {"id": "C", "x": 0, "y": 1000, "capacity": 0},
+                    ],
+                }
+            ],
+        }
+        r = load_plan(state, 0, 0)
+        self.assertFalse(r["plannable"])
+        self.assertIn("棚板自重", r["reason"])
+
+    def test_load_plan_unsupported_layer_not_plannable(self):
+        state = self._plan_rack_two_ware_layers()
+        state["layers"][1]["posts"] = []  # 顶层无立柱
+        r = load_plan(state, 0, 0)
+        self.assertFalse(r["plannable"])
+        self.assertIn("无有效承托", r["reason"])
+        self.assertEqual([u["index"] for u in r["unsupportedLayers"]], [1])
+
+    def test_load_plan_degenerate_hull_not_plannable(self):
+        state = self._plan_rack_two_ware_layers()
+        state["layers"][0]["posts"] = [  # 底层落点共线 → 凸包退化
+            {"id": "A", "x": 0, "y": 500, "capacity": 0},
+            {"id": "B", "x": 500, "y": 500, "capacity": 0},
+            {"id": "C", "x": 1000, "y": 500, "capacity": 0},
+        ]
+        r = load_plan(state, 0, 0)
+        self.assertFalse(r["plannable"])
+        self.assertIn("凸包退化", r["reason"])
+
+    def test_load_plan_empty_rack_not_plannable(self):
+        r = load_plan({"car": {"w": 1000, "d": 1000}, "layers": []}, 0, 0)
+        self.assertFalse(r["plannable"])
+        self.assertIn("没有任何层", r["reason"])
+
+    def test_load_plan_no_ware_layers_gives_empty_plan(self):
+        state = self._plan_rack_two_ware_layers()
+        for L in state["layers"]:
+            L["wareWeight"] = 0
+        r = load_plan(state, 0, 0)
+        self.assertTrue(r["plannable"])
+        self.assertEqual(r["wareLayerCount"], 0)
+        self.assertEqual(r["order"], [])
+        self.assertEqual(r["steps"], [])
+        # 最小裕量即初始状态裕量（仅棚板自重，重心 x=700 → 300）
+        self.assertEqual(r["minMargin"], 300.0)
+        self.assertEqual(r["minMarginStep"], 0)
+        self.assertTrue(r["allStable"])
+
+    def test_load_plan_invalid_accel_raises(self):
+        state = self._plan_rack_two_ware_layers()
+        with self.assertRaises(ValueError):
+            load_plan(state, "x", 0)
+        with self.assertRaises(ValueError):
+            load_plan(state, 0, None)
+        with self.assertRaises(ValueError):
+            load_plan(state, float("inf"), 0)
+        with self.assertRaises(ValueError):
+            load_plan(state, 0, float("nan"))
+
+    def test_load_plan_sample_plannable_and_does_not_mutate_input(self):
+        with open(SAMPLE, encoding="utf-8") as f:
+            state = json.load(f)
+        before = json.loads(json.dumps(state, ensure_ascii=False))
+        r = load_plan(state, 0.1, 0)
+        self.assertTrue(r["plannable"])
+        self.assertEqual(state, before)  # 只读：不修改输入
+        # 示例 3 层坯件均大于 0：顺序为 [0,1,2] 的某个排列，逐步覆盖全部层
+        self.assertEqual(sorted(r["order"]), [0, 1, 2])
+        self.assertEqual([s["step"] for s in r["steps"]], [1, 2, 3])
+        self.assertEqual(r["steps"][-1]["wareCum"], r["wareTotal"])
+        self.assertEqual(r["wareTotal"], 360 + 400 + 620)
+        self.assertEqual(r["boardWeight"], 240 + 200 + 160)
+        # 最小裕量 = 初始与各步裕量的最小值，minMarginStep 指向其所在行
+        margins = [r["initial"]["margin"]] + [s["margin"] for s in r["steps"]]
+        self.assertEqual(r["minMargin"], min(margins))
+        self.assertEqual(margins[r["minMarginStep"]], r["minMargin"])
+        self.assertEqual(r["allStable"], r["minMargin"] > 0)
 
 
 if __name__ == "__main__":

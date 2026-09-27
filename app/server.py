@@ -21,6 +21,13 @@ POST /api/overturn   层架抗倾覆试算：body {"state"(可省), "ax": 0.1, "
                      为支撑多边形，把重心投影按 (ax, ay)·重心高度平移后计算到凸包
                      边界的带符号最短距离，判定稳定/临界/倾覆；只计算，不写盘；
                      落点不足以形成非零面积或任一层无有效承托时返回 evaluable=false
+POST /api/load-plan  逐层装货顺序规划：body {"state"(可省), "ax": 0.1, "ay": 0}，
+                     以当前架体为准，保留全部棚板自重、先把坯件重量置零，再按整层
+                     坯件一次加入；对至多 12 个坯件重量大于零的层用子集动态规划求
+                     「全过程最小抗倾覆裕量最大」的装货顺序（同分按层序号字典序），
+                     返回逐步新增层/累计坯件/裕量/判定；只计算，不写盘；
+                     无有效承托、凸包退化、初始棚板总重为零或坯件层数超上限时
+                     返回 plannable=false 与原因
 POST /api/reset      恢复内置示例数据
 """
 
@@ -32,7 +39,14 @@ import tempfile
 
 from flask import Flask, jsonify, request, send_from_directory
 
-from .calc import calculate, load_shed, overturn_check, simulate, suggest_posts
+from .calc import (
+    calculate,
+    load_plan,
+    load_shed,
+    overturn_check,
+    simulate,
+    suggest_posts,
+)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -168,6 +182,22 @@ def api_overturn():
     # 加速度分量非法（非数字）→ 400；几何条件不足（无承托/凸包退化）属于正常结果 → 200 + evaluable=false
     try:
         result = overturn_check(state, payload.get("ax", 0), payload.get("ay", 0))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"ok": True, **result})
+
+
+@app.route("/api/load-plan", methods=["POST"])
+def api_load_plan():
+    """逐层装货顺序规划：子集 DP 求最小裕量最大的装货顺序。只计算，不写盘、不改已保存状态。"""
+    payload = request.get_json(force=True, silent=True)
+    payload = payload if isinstance(payload, dict) else {}
+    state = payload.get("state")
+    if not isinstance(state, dict):
+        state = load_state()
+    # 加速度分量非法（非数字）→ 400；无法规划（无承托/凸包退化/超 12 层等）属于正常结果 → 200 + plannable=false
+    try:
+        result = load_plan(state, payload.get("ax", 0), payload.get("ay", 0))
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify({"ok": True, **result})

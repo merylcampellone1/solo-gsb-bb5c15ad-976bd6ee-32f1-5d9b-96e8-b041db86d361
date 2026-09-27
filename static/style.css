@@ -388,6 +388,35 @@ ul.sug-issues li.is-removed .itype { color: var(--normal); }
 }
 .ov-reason b { color: var(--warn); }
 
+/* ---------- 逐层装货顺序规划 ---------- */
+.loadplan-panel { border-style: dashed; border-color: #7a5a2c; }
+.loadplan-panel .btn-run { border-color: #e8a646; color: #e8a646; }
+.loadplan-panel .btn-run:hover { background: rgba(232,166,70,0.12); }
+.badge.has-loadplan { color: #e8a646; border-color: #e8a646; }
+.badge.has-loadplan.stable { color: var(--normal); border-color: var(--normal); }
+.badge.has-loadplan.unstable { color: var(--error); border-color: var(--error); }
+.lp-banner {
+  margin: 8px 0 0; padding: 8px 10px; border-radius: 7px; font-size: 12px;
+  background: var(--panel2); border: 1px solid var(--line);
+}
+.lp-banner.ok { border-color: var(--normal); color: var(--normal); }
+.lp-banner.bad { border-color: var(--error); color: var(--error); }
+.lp-banner.bad b { color: var(--error); }
+.lp-order { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin: 6px 0 8px; }
+.lp-chip {
+  font-size: 11px; padding: 2px 9px; border-radius: 20px;
+  border: 1px solid var(--line); background: #0d1322;
+}
+.lp-chip.init { color: var(--muted); border-style: dashed; }
+.lp-arrow { color: var(--muted); font-size: 11px; }
+.lp-table td em {
+  font-style: normal; font-size: 9px; color: var(--warn);
+  border: 1px solid var(--warn); border-radius: 8px; padding: 0 5px; margin-left: 4px;
+}
+.lp-table tr.lp-min td { background: rgba(240,176,60,0.07); }
+.lp-table tr.lp-unstable td { color: var(--error); }
+.lp-table tr.lp-unstable td b { color: var(--error); }
+
 @media (max-width: 1200px) {
   .layout { grid-template-columns: 330px 1fr; }
   .views { grid-template-columns: 1fr; }
